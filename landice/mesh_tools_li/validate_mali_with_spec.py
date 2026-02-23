@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 
+print("Importing toolboxes")
+
 import xarray as xr
 import os
 import numpy as np
 import subprocess
 from argparse import ArgumentParser
-from mpas_tools.scrip.from_mpas import scrip_from_mpas
-from mpas_tools.logging import check_call
 import tifffile as tiff
+from scipy.interpolate import griddata
+from scipy.stats import binned_statistic_2d
 
-class validateWithSpec :
-
+class validateWithSpec:
     def __init__(self):
         print("Gathering Information ...")
         parser = ArgumentParser(prog='validate_mali_with_spec.py', 
@@ -20,83 +21,53 @@ class validateWithSpec :
                             'Values of 0 represent specularity content below 20%; values of 3.3 represent specularity content above 20% and energy 1' 
                             'microsecond below the bed 15 dB lower than the bed echo, and values of 6.7 represent specularity content above 20% and energy' 
                             '1 microsecond below the bed 15 dB within than the bed echo.')
-        parser.add_argument("--compRes", dest="compRes", type=float, help="Grid resolution on which to interpolate and validate (meters)", default="5000")
-        parser.add_argument("--ntasks", dest="ntasks", type=str, help="Number of processors to use with ESMF_RegridWeightGen", default='128')
+        parser.add_argument("--compRes", dest="compRes", type=float, help="Grid resolution on which to interpolate and validate (meters)", default=5000.0)
+        parser.add_argument("--Wr", dest="Wr", type=float, help="Simulation bed bump height", default=0.1)
         args = parser.parse_args()
         self.options = args
 
-    def create_dest_scrip_file(self):
+    def interpolate_to_common_grid(self):
+        # establish common grid
         res = self.options.compRes
 
         ds_mali = xr.open_dataset(self.options.maliFile, decode_times=False, decode_cf=False)
         xCell = ds_mali['xCell'][:].values
         yCell = ds_mali['yCell'][:].values
-
+        
         xmin = np.min(xCell)
         xmax = np.max(xCell)
         ymin = np.min(yCell)
         ymax = np.max(yCell)
 
-        # Define cell centers 
-        x_center = np.arange(xmin, xmax, res)
-        y_center = np.arange(ymin, ymax, res)
-
-        ds_scrip = xr.Dataset()
-        x = xr.DataArray(x_center.astype('float64'), dims=("nx"))
-        y = xr.DataArray(y_center.astype('float64'), dims=("ny"))
-        ds_scrip['x'] = x
-        ds_scrip['y'] = y
-        ds_scrip.to_netcdf('dest.scrip.initial.tmp.nc')
-        ds_scrip.close()
-        subprocess.run(["create_scrip_file_from_planar_rectangular_grid", "-i", "dest.scrip.initial.tmp.nc",
-                        "-s", "dest.scrip.tmp.nc", "-p", "ais-bedmap2", "-r", "2"])
+        x_edges = np.arange(xmin, xmax + res, res)
+        y_edges = np.arange(ymin, ymax + res, res)
         
-        # Convert to radians from degrees
-        ds_scrip = xr.open_dataset('dest.scrip.tmp.nc')
-        center_lon = ds_scrip['grid_center_lon']
-        center_lat = ds_scrip['grid_center_lat']
-        corner_lon = ds_scrip['grid_corner_lon']
-        corner_lat = ds_scrip['grid_corner_lat']
+        x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+        y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+
+        # Remap MALI
+        Xgrid, Ygrid = np.meshgrid(x_centers, y_centers)
         
-        mask = center_lon < 0
-        center_lon[mask] = center_lon[mask] + 360
-        corner_lon[mask] = corner_lon[mask] + 360
+        W = ds_mali['waterThickness'][-1,:].values # Assume last time step for now
+        W_remapped = griddata(points=(xCell, yCell),
+                                  values=W,
+                              xi=(Xgrid, Ygrid),
+                              method='linear')
+        
+        Z = ds_mali['bedTopography'][-1,:].values # Assume last time step for now
+        Z_remapped = griddata(points=(xCell, yCell),
+                                  values=Z,
+                              xi=(Xgrid, Ygrid),
+                              method='linear')
+        
+        H = ds_mali['thickness'][-1,:].values # Assume last time step for now
+        H_remapped = griddata(points=(xCell, yCell),
+                                  values=H,
+                              xi=(Xgrid, Ygrid),
+                              method='linear')
 
-        center_lon = center_lon * 2*np.pi / 360
-        center_lat = center_lat * 2*np.pi / 360
-        corner_lon = corner_lon * 2*np.pi / 360
-        corner_lat = corner_lat * 2*np.pi / 360
-
-        ds_scrip['center_lon'] = center_lon
-        ds_scrip['center_lat'] = center_lat
-        ds_scrip['corner_lon'] = corner_lon
-        ds_scrip['corner_lat'] = corner_lat
-
-        ds_scrip.to_netcdf('dest.scrip.nc')
-        ds_scrip.close()
-
-    def interpolate_mali(self):
-        scrip_from_mpas(self.options.maliFile, 'mali.scrip.nc')
-        args = ['srun',
-                '-n', self.options.ntasks, 'ESMF_RegridWeightGen',
-                '--source', 'mali.scrip.nc',
-                '--destination', 'dest.scrip.nc',
-                '--weight', 'mali_to_dest.nc',
-                '--method', 'bilinear',
-                '--netcdf4',
-                "--dst_regional", "--src_regional", '--ignore_unmapped']
-        check_call(args)
-
-        args_remap = ["ncremap",
-                "-i", self.options.maliFile,
-                "-o", 'mali_remapped.nc',
-                "-m", 'mali_to_dest.nc',
-                "-v", 'waterThickness']
-        check_call(args_remap)    
-
-    def interpolate_spec(self):
         # Open geoTiff and convert to netcdf
-        with tiff.TiffFile("self.options.specTiff") as tif:
+        with tiff.TiffFile(self.options.specTiff) as tif:
             page = tif.pages[0]
             specData = page.asarray()
             scale = page.tags["ModelPixelScaleTag"].value
@@ -112,83 +83,104 @@ class validateWithSpec :
             x = x0 + np.arange(cols) * pixelWidth
             y = y0 - np.arange(rows) * pixelHeight
 
-        specData[np.isnan(specData)] = 0
+        specData = specData.astype(float)
+        specData[specData == 0] = np.nan
+
+        [Xspec, Yspec] = np.meshgrid(x,y)
+        specData = specData.ravel()
+        Xspec = Xspec.ravel()
+        Yspec = Yspec.ravel()
+
+        mask = np.isfinite(specData)
+        specData = specData[mask]
+        Xspec = Xspec[mask]
+        Yspec = Yspec[mask]
+
+        spec_remapped, x_edges_out, y_edges_out, binnum = binned_statistic_2d(
+                Xspec, Yspec, specData,
+                statistic='mean',
+                bins=[x_edges,y_edges]
+                )
+        spec_remapped = spec_remapped.T
+        print(f"spec shape: {spec_remapped.shape}")
+        print(f"H shape: {H_remapped.shape}")
+        print(f"Z shape: {Z_remapped.shape}")
+
+        # Filter specularity data
+        floating = (910/1028) * H_remapped + Z_remapped <= 0 
+        spec_remapped[floating] = np.nan
+        spec_remapped[H_remapped == 0] = np.nan
+
+        east_AIS = Xgrid >= 0
+       
+        east_valid = east_AIS & np.isfinite(spec_remapped) & np.isfinite(W_remapped)
+        west_valid = ~east_AIS & np.isfinite(spec_remapped) & np.isfinite(W_remapped)
+
+        # calculate Rwt
+        Rwt_e = W_remapped[east_valid] / self.options.Wr
+        Rwt_w = W_remapped[west_valid] / self.options.Wr
+
+        # Define comparison thresholds
+        Sthresh = 3.33 # Physically-based specularity threshold
+        Rthresh = np.arange(0.95, 1.0, 0.01)
+
+        Strue_e = spec_remapped[east_valid] >= Sthresh 
+        Sfalse_e = spec_remapped[east_valid] < Sthresh
+        Strue_w = spec_remapped[west_valid] >= Sthresh
+        Sfalse_w = spec_remapped[west_valid] < Sthresh
         
-        ds_spec = xr.Dataset()
-        x = xr.DataArray(x_center.astype('float64'), dims=("nx"))
-        y = xr.DataArray(y_center.astype('float64'), dims=("ny"))
-        ds_spec['x'] = x
-        ds_spec['y'] = y
-        ds_spec['spec'] = xr.DataArray(np.array(specData).astype('float64'), dims=("nx","ny"))
-        specMask = np.zeros(np.array(spec).shape)
-        specMask[spec == 3.3] = 1
-        specMask[spec == 6.7] = 2
-        ds_spec['specMask'] = xr.DataArray(specMask.astype('int32'), dims=("nx","ny"))
-        ds_scrip.to_netcdf('spec.nc')
-        ds_scrip.close()
+        Strue_e = Strue_e[:,None]
+        Sfalse_e = Sfalse_e[:,None]
+        Strue_w = Strue_w[:,None]
+        Sfalse_w = Sfalse_w[:,None]
 
-        # ais-bedmap2 is same as EPSG:3031 (Antarctic Polar Stereographic)
-        subprocess.run(["create_scrip_file_from_planar_rectangular_grid", "-i", "spec.nc",
-                        "-s", "spec.scrip.tmp.nc", "-p", "ais-bedmap2", "-r", "2"])
+        Rtrue_e = Rwt_e[:, None] >= Rthresh
+        Rfalse_e = ~Rtrue_e
+        Rtrue_w = Rwt_w[:, None] >= Rthresh
+        Rfalse_w = ~Rtrue_w
+
+        print(f"Rtrue_e: {Rtrue_e.shape}")
+        print(f"Strue_e: {Strue_e.shape}")
+        tp_e = np.sum(Strue_e & Rtrue_e, axis=0)
+        tn_e = np.sum(Sfalse_e & Rfalse_e, axis=0)
+        fp_e = np.sum(Sfalse_e & Rtrue_e, axis=0)
+        fn_e = np.sum(Strue_e & Rfalse_e, axis=0)
+
+        tp_w = np.sum(Strue_w & Rtrue_w, axis=0)
+        tn_w = np.sum(Sfalse_w & Rfalse_w, axis=0)
+        fp_w = np.sum(Sfalse_w & Rtrue_w, axis=0)
+        fn_w = np.sum(Strue_w & Rfalse_w, axis=0)
         
-        # Convert to radians from degrees
-        ds_scrip = xr.open_dataset('spec.scrip.tmp.nc')
-        center_lon = ds_scrip['grid_center_lon']
-        center_lat = ds_scrip['grid_center_lat']
-        corner_lon = ds_scrip['grid_corner_lon']
-        corner_lat = ds_scrip['grid_corner_lat']
+        true_agree_e = tp_e / (tp_e + fn_e)
+        false_agree_e = tn_e / (tn_e + fp_e)
+
+        true_agree_w = tp_w / (tp_w + fn_w)
+        false_agree_w = tn_w / (tn_w + fp_w)
         
-        mask = center_lon < 0
-        center_lon[mask] = center_lon[mask] + 360
-        corner_lon[mask] = corner_lon[mask] + 360
+        balanced_score_e = 0.5 * (true_agree_e + false_agree_e)
+        balanced_score_w = 0.5 * (true_agree_w + false_agree_w)
 
-        center_lon = center_lon * 2*np.pi / 360
-        center_lat = center_lat * 2*np.pi / 360
-        corner_lon = corner_lon * 2*np.pi / 360
-        corner_lat = corner_lat * 2*np.pi / 360
+        print(f"true agree east: {true_agree_e}")
+        print(f"false agree east: {false_agree_e}")
+        print(f"true agree west: {true_agree_w}")
+        print(f"false agree west: {false_agree_w}")
+        print(f"balanced score east: {balanced_score_e}")
+        print(f"balanced score west: {balanced_score_w}")
+        print(f"total balanced score: {balanced_score_e + balanced_score_w}")
 
-        ds_scrip['center_lon'] = center_lon
-        ds_scrip['center_lat'] = center_lat
-        ds_scrip['corner_lon'] = corner_lon
-        ds_scrip['corner_lat'] = corner_lat
-
-        ds_scrip.to_netcdf('spec.scrip.nc')
-        ds_scrip.close()
-
-        args = ['srun',
-                '-n', self.options.ntasks, 'ESMF_RegridWeightGen',
-                '--source', 'spec.scrip.nc',
-                '--destination', 'dest.scrip.nc',
-                '--weight', 'spec_to_dest.nc',
-                '--method', 'conserve',
-                '--netcdf4',
-                "--dst_regional", "--src_regional", '--ignore_unmapped']
-        check_call(args)
-
-        args_remap = ["ncremap",
-                "-i", 'spec.nc',
-                "-o", 'spec_remapped.nc',
-                "-m", 'spec_to_dest.nc']
-        check_call(args_remap)    
-
-    #def validate(self):
-        #ds_spec = xr.open_dataset('spec_remapped.nc')
-        #ds_mali = xr.open_dataset('mali_remapped.nc')
-
-        #spec = ds_spec['spec'][:].values
-        #waterThickness = ds_mali['waterThickness'][:].values
-
+        ds_out = xr.Dataset()
+        ds_out['X'] = xr.DataArray(Xgrid.astype('float64'), dims=("nx","ny"))
+        ds_out['Y'] = xr.DataArray(Ygrid.astype('float64'), dims=("nx","ny"))
+        ds_out['spec'] = xr.DataArray(spec_remapped.astype('float64'), dims=("nx","ny"))
+        ds_out['W'] = xr.DataArray(W_remapped.astype('float64'), dims=("nx","ny"))
+        ds_out['H'] = xr.DataArray(H_remapped.astype('float64'), dims=("nx","ny"))
+        ds_out['Z'] = xr.DataArray(Z_remapped.astype('float64'), dims=("nx","ny"))
+        ds_out.to_netcdf('remapped.nc')
 
 def main():
     run = validateWithSpec()
     
-    run.create_dest_scrip_file()
-    
-    run.interpolate_mali()
-
-    run.interpolate_spec()
-
-    #run.validate()
+    run.interpolate_to_common_grid()
 
 if __name__ == "__main__":
     main()
