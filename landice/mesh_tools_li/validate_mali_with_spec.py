@@ -10,6 +10,9 @@ from argparse import ArgumentParser
 import tifffile as tiff
 from scipy.interpolate import griddata
 from scipy.stats import binned_statistic_2d
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import cmocean
 
 class validateWithSpec:
     def __init__(self):
@@ -102,9 +105,6 @@ class validateWithSpec:
                 bins=[x_edges,y_edges]
                 )
         spec_remapped = spec_remapped.T
-        print(f"spec shape: {spec_remapped.shape}")
-        print(f"H shape: {H_remapped.shape}")
-        print(f"Z shape: {Z_remapped.shape}")
 
         # Filter specularity data
         floating = (910/1028) * H_remapped + Z_remapped <= 0 
@@ -139,8 +139,6 @@ class validateWithSpec:
         Rtrue_w = Rwt_w[:, None] >= Rthresh
         Rfalse_w = ~Rtrue_w
 
-        print(f"Rtrue_e: {Rtrue_e.shape}")
-        print(f"Strue_e: {Strue_e.shape}")
         tp_e = np.sum(Strue_e & Rtrue_e, axis=0)
         tn_e = np.sum(Sfalse_e & Rfalse_e, axis=0)
         fp_e = np.sum(Sfalse_e & Rtrue_e, axis=0)
@@ -160,27 +158,53 @@ class validateWithSpec:
         balanced_score_e = 0.5 * (true_agree_e + false_agree_e)
         balanced_score_w = 0.5 * (true_agree_w + false_agree_w)
 
-        print(f"true agree east: {true_agree_e}")
-        print(f"false agree east: {false_agree_e}")
-        print(f"true agree west: {true_agree_w}")
-        print(f"false agree west: {false_agree_w}")
-        print(f"balanced score east: {balanced_score_e}")
-        print(f"balanced score west: {balanced_score_w}")
-        print(f"total balanced score: {balanced_score_e + balanced_score_w}")
+        self.BA_e = np.max(balanced_score_e)
+        self.BA_w = np.max(balanced_score_w)
+        print(f"balanced accuracy east: {self.BA_e}")
+        print(f"balanced accuracy west: {self.BA_w}")
 
-        ds_out = xr.Dataset()
-        ds_out['X'] = xr.DataArray(Xgrid.astype('float64'), dims=("nx","ny"))
-        ds_out['Y'] = xr.DataArray(Ygrid.astype('float64'), dims=("nx","ny"))
-        ds_out['spec'] = xr.DataArray(spec_remapped.astype('float64'), dims=("nx","ny"))
-        ds_out['W'] = xr.DataArray(W_remapped.astype('float64'), dims=("nx","ny"))
-        ds_out['H'] = xr.DataArray(H_remapped.astype('float64'), dims=("nx","ny"))
-        ds_out['Z'] = xr.DataArray(Z_remapped.astype('float64'), dims=("nx","ny"))
-        ds_out.to_netcdf('remapped.nc')
+        self.Xgrid = Xgrid
+        self.Ygrid = Ygrid
+        self.spec = spec_remapped
+        self.W = W_remapped
+        self.H = H_remapped
+        self.Z = Z_remapped
+        self.Rthresh = Rthresh
+        self.ind_Rmax = np.argmax(balanced_score_e + balanced_score_w) # for plotting
+        self.Sthresh = Sthresh
+        self.floating = floating
+
+    def plot_comparison_maps(self):
+
+        fig,ax = plt.subplots(figsize=(8,5))
+        H = self.H
+        H[self.floating] = np.nan
+        ax.contourf(self.Xgrid, self.Ygrid, self.H, levels=[0.1, np.nanmax(self.H)], colors=[[0.9, 0.9, 0.9]])
+        
+        cmap = cmocean.cm.matter
+        cmap = cmocean.tools.crop_by_percent(cmap, 45, which='max', N=None)
+        s = np.full(self.Xgrid.shape, np.nan)
+        s[self.spec >= self.Sthresh] = 1
+        s[self.spec < self.Sthresh] = 0
+        ax.pcolor(self.Xgrid, self.Ygrid, s, cmap=cmap)
+        
+        lev = self.Rthresh[self.ind_Rmax]
+        ax.contour(self.Xgrid, self.Ygrid, self.W/self.options.Wr, levels=[lev], colors='k', linewidths=0.75)
+        
+        ax.set_xlim(-2e6, 2.6e6)
+        ax.set_ylim(-2e6, 0)
+        ax.text(-1.5e6, -1.55e6, f"balanced accuracy west: {np.round(self.BA_w,2)}", fontsize=10) 
+        ax.text(-1.5e6, -1.8e6, f"balanced accuracy east: {np.round(self.BA_e,2)}", fontsize=10) 
+        ax.set_aspect('equal', adjustable='box')
+        plt.savefig("spec_subglacialHydro_validation.png",dpi=1000,bbox_inches="tight")
+        
 
 def main():
     run = validateWithSpec()
     
     run.interpolate_to_common_grid()
+
+    run.plot_comparison_maps()
 
 if __name__ == "__main__":
     main()
